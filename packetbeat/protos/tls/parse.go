@@ -26,6 +26,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/elastic/beats/v7/libbeat/common/streambuf"
 	"github.com/elastic/elastic-agent-libs/logp"
@@ -70,6 +71,7 @@ const (
 	certificateRequest handshakeType = 13
 	clientKeyExchange  handshakeType = 16
 	certificateStatus  handshakeType = 22
+	keyUpdate		   handshakeType = 24
 )
 
 type parserResult int8
@@ -106,6 +108,11 @@ type parser struct {
 
 	// If a key-exchange message has been sent. Used to detect session resumption
 	keyExchanged bool
+
+	keyMap *map[string]map[string]string
+	mu *sync.Mutex
+
+	// masterSecret *string
 }
 
 // https://www.rfc-editor.org/rfc/rfc6960#section-4.2.1
@@ -247,9 +254,39 @@ func (hello *helloMessage) supportedCiphers() []string {
 	return ciphers
 }
 
-func (parser *parser) parse(buf *streambuf.Buffer) parserResult {
+// Add a helper to check if the header looks valid (e.g., TLS version and length bounds)
+func isValidTLSHeaderBytes(header []byte) bool {
+    if len(header) < recordHeaderSize {
+        return false
+    }
+    // Check TLS version: expect major == 3
+    if header[1] != 3 {
+        return false
+    }
+    // Optionally check that the recorded length is within bounds.
+    length := int(header[3])<<8 | int(header[4])
+    if length <= 0 || length > maxTLSRecordLength {
+        return false
+    }
+    return true
+}
+
+func (parser *parser) parse(st *stream, mu *sync.Mutex, sslKeyMap *map[string]map[string]string) parserResult {
+	parser.keyMap = sslKeyMap
+	parser.mu = mu
+	buf := &st.Buf
+	random := &st.random
+	sequenceNumber := &st.sequenceNumber
+
+	
 	for buf.Avail(recordHeaderSize) {
 
+		headerBytes := buf.Bytes()[:recordHeaderSize]
+        if !isValidTLSHeaderBytes(headerBytes) {
+            logp.Warn("Invalid TLS header bytes: %x", headerBytes)
+            return resultFailed
+        }
+		
 		header, err := readRecordHeader(buf)
 		if err != nil || !header.isValid() {
 			if err != nil {
@@ -265,42 +302,85 @@ func (parser *parser) parse(buf *streambuf.Buffer) parserResult {
 		}
 
 		switch header.recordType {
+
 		case recordTypeChangeCipherSpec: // single message of size 1 (byte 1)
+			//(*sequenceNumber)++
 			if isDebug {
 				debugf("handshake completed")
 			}
 			// discard remaining data for this stream (encrypted)
 			_ = buf.Advance(buf.Len())
+			//_ = buf.Advance(limit)
 			return resultEncrypted
 
 		case recordTypeHandshake:
+			(*sequenceNumber) = 0
 			if isDebug {
 				debugf("got handshake record of size %d", header.length)
 			}
-			if err = parser.bufferHandshake(buf, int(header.length)); err != nil {
+			if err = parser.bufferHandshake(buf, int(header.length), random, sequenceNumber); err != nil {
 				logp.Warn("Error parsing handshake message: %v", err)
 				return resultFailed
 			}
 
 		case recordTypeAlert:
+			
 			if err = parser.parseAlert(newBufferView(buf, recordHeaderSize, int(header.length))); err != nil {
+				(*sequenceNumber)++
 				logp.Warn("Error parsing alert message: %v", err)
 				return resultFailed
 			}
+			//(*sequenceNumber)++
 
 		case recordTypeApplicationData:
+			
 			// TODO: Request / Response analytics
+
+			label := "CLIENT_TRAFFIC_SECRET_0"
+			if parser.direction == dirServer {
+			 label = "SERVER_TRAFFIC_SECRET_0"	
+			}
+
+			if parser.hello == nil {
+				(*sequenceNumber)++
+				return resultFailed
+			}
+			
+			ms, _ := getSecret(hex.EncodeToString(*random), label, parser.mu, parser.keyMap)
+			applicationSecret, _ := hex.DecodeString(ms)
+			
+			if (ms != ""){
+				bytes := make([]byte, header.length + 5)
+				buf.ReadAt(bytes, 0)
+
+				result, _ := DecryptTLSPacket(applicationSecret, bytes, "TLS1.3", "TLS_AES_128_GCM_SHA256", (*sequenceNumber), nil, nil)
+
+				//mod := 
+
+
+
+				
+			
+				debugf("decryption result: %d", result)
+			}
 			if isDebug {
 				debugf("ignoring application data length %d", header.length)
 			}
+			(*sequenceNumber)++
+
 
 		default:
+			//(*sequenceNumber)++
 			if isDebug {
 				debugf("ignoring record type %d length %d", header.recordType, header.length)
 			}
 		}
 
-		_ = buf.Advance(limit)
+		// Advance the buffer by the record size
+        if err := buf.Advance(limit); err != nil {
+            logp.Warn("failed to advance buffer: %v", err)
+            return resultFailed
+        }
 	}
 
 	if buf.Len() == 0 {
@@ -309,7 +389,7 @@ func (parser *parser) parse(buf *streambuf.Buffer) parserResult {
 	return resultMore
 }
 
-func (parser *parser) bufferHandshake(buf *streambuf.Buffer, length int) (err error) {
+func (parser *parser) bufferHandshake(buf *streambuf.Buffer, length int, random *[]byte, sequenceNumber *uint64) (err error) {
 	// TODO: parse in-place if message in received buffer is complete
 	err = parser.handshakeBuf.Append(buf.Bytes()[recordHeaderSize : recordHeaderSize+length])
 	if err != nil {
@@ -349,7 +429,7 @@ func (parser *parser) bufferHandshake(buf *streambuf.Buffer, length int) (err er
 			break
 		}
 		if !parser.parseHandshake(header.handshakeType,
-			bufferView{&parser.handshakeBuf, handshakeHeaderSize, limit}) {
+			bufferView{&parser.handshakeBuf, handshakeHeaderSize, limit}, random, sequenceNumber) {
 			_ = parser.handshakeBuf.Advance(limit)
 			return fmt.Errorf("bad handshake %+v", header)
 		}
@@ -368,11 +448,18 @@ func (parser *parser) setDirection(dir direction) {
 	parser.direction = dir
 }
 
-func (parser *parser) parseHandshake(handshakeType handshakeType, buffer bufferView) bool {
+func (parser *parser) parseHandshake(handshakeType handshakeType, buffer bufferView, random *[]byte, sequenceNumber *uint64) bool {
 	if isDebug {
 		debugf("got handshake message %v [%d]", handshakeType, buffer.length())
 	}
 	switch handshakeType {
+	case keyUpdate:
+        // Reset sequence number as required by RFC 8446
+        (*sequenceNumber) = 0
+        if isDebug {
+            debugf("received KeyUpdate message")
+        }
+        return true
 	case helloRequest:
 		parser.setDirection(dirServer)
 		return parseHelloRequest(buffer)
@@ -382,6 +469,21 @@ func (parser *parser) parseHandshake(handshakeType handshakeType, buffer bufferV
 		if parser.hello = parseClientHello(buffer); parser.hello == nil {
 			return false
 		}
+
+		// label := "CLIENT_RANDOM"
+		// if parser.hello.version.String() == "TLS 1.3" {
+		// 	label = "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
+		// }
+		// // TODO: forcing TLS 1.3 for testing
+		// label = "EXPORTER_SECRET"
+
+		// ms, _ := getSecret(hex.EncodeToString(parser.hello.random), label, parser.mu, parser.keyMap)
+		// if ms != "" {
+		// 	(*masterSecret) = ms
+		// }
+		(*random) = parser.hello.random
+
+
 		return true
 
 	case serverHello:
@@ -389,6 +491,20 @@ func (parser *parser) parseHandshake(handshakeType handshakeType, buffer bufferV
 		if parser.hello = parseServerHello(buffer); parser.hello == nil {
 			return false
 		}
+
+		// label := "SERVER_RANDOM"
+		// if parser.hello.version.String() == "TLS 1.3" {
+		// 	label = "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+		// }
+		// // TODO: forcing TLS 1.3 for testing
+		// label = "EXPORTER_SECRET"
+
+		// ms, _ := getSecret(hex.EncodeToString(parser.hello.random), label, parser.mu, parser.keyMap)
+		// if ms != "" {
+		// 	(*masterSecret) = ms
+		// }
+		(*random) = parser.hello.random
+
 		return true
 
 	case certificate:

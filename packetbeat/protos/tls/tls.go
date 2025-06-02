@@ -20,6 +20,7 @@ package tls
 import (
 	"crypto/x509"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
@@ -41,6 +42,9 @@ type stream struct {
 	parser       parser
 	tcptuple     *common.TCPTuple
 	cmdlineTuple *common.ProcessTuple
+	sequenceNumber uint64
+	random 		 []byte
+	masterSecret *string 
 }
 
 type tlsConnectionData struct {
@@ -49,6 +53,9 @@ type tlsConnectionData struct {
 	handshakeCompleted int8
 	eventSent          bool
 	startTime, endTime time.Time
+	
+
+	//masterSecret string // Stores the master secret for the session
 }
 
 // TLS protocol plugin
@@ -62,6 +69,11 @@ type tlsPlugin struct {
 	transactionTimeout     time.Duration
 	results                protos.Reporter
 	watcher                *procs.ProcessesWatcher
+
+	keyMap map[string]map[string]string
+	mu sync.Mutex
+
+	masterSecretMap map[common.HashableIPPortTuple]string
 }
 
 var (
@@ -72,11 +84,25 @@ var (
 	_ protos.TCPPlugin = &tlsPlugin{}
 )
 
+// init registers the "tls" protocol with the protos package by associating it
+// with the New function. This ensures that the TLS protocol is properly
+// initialized and available for use within the application.
 func init() {
 	protos.Register("tls", New)
 }
 
-// New returns a new instance of the TLS plugin
+// New creates a new instance of the TLS plugin. It initializes the plugin
+// with the provided configuration and dependencies.
+//
+// Parameters:
+//   - testMode: A boolean indicating whether the plugin is running in test mode.
+//   - results: A Reporter interface used to report protocol results.
+//   - watcher: A ProcessesWatcher instance to monitor process information.
+//   - cfg: A configuration object containing the plugin's settings.
+//
+// Returns:
+//   - protos.Plugin: The initialized TLS plugin instance.
+//   - error: An error if the initialization fails.
 func New(
 	testMode bool,
 	results protos.Reporter,
@@ -97,6 +123,19 @@ func New(
 	return p, nil
 }
 
+// init initializes the tlsPlugin with the provided configuration, reporter, and process watcher.
+// It sets up the plugin based on the given tlsConfig, assigns the results reporter and process watcher,
+// and enables debug logging if the "tls" debug flag is set. Additionally, if decryption is enabled,
+// it initializes a map to store SSL keys, creates a mutex for synchronization, and starts a goroutine
+// to watch the SSL key log file.
+//
+// Parameters:
+//   - results: A protos.Reporter used to report protocol-specific events.
+//   - watcher: A procs.ProcessesWatcher to monitor process-related information.
+//   - config: A tlsConfig containing the TLS plugin configuration.
+//
+// Returns:
+//   - error: An error if the plugin fails to initialize from the configuration, otherwise nil.
 func (plugin *tlsPlugin) init(results protos.Reporter, watcher *procs.ProcessesWatcher, config *tlsConfig) error {
 	if err := plugin.setFromConfig(config); err != nil {
 		return err
@@ -106,9 +145,33 @@ func (plugin *tlsPlugin) init(results protos.Reporter, watcher *procs.ProcessesW
 	plugin.watcher = watcher
 	isDebug = logp.IsDebug("tls")
 
+	// If decryption is enabled
+	// TODO: create an actual IF statement based on a config value.  Currenlty set to true for testing.
+	if (true) {
+		// Map to store the SSL keys
+		plugin.keyMap = make(map[string]map[string]string)
+		plugin.mu = sync.Mutex{}
+
+		plugin.masterSecretMap = make(map[common.HashableIPPortTuple]string)
+
+		// Start watching the SSL key log file
+		go WatchSSLKeyLog("/tmp/sslkey.log", &plugin.keyMap, &plugin.mu)
+	}
+
 	return nil
 }
 
+// setFromConfig initializes the tlsPlugin instance with the provided configuration.
+// It sets various plugin parameters such as ports, certificate handling options,
+// detailed field inclusion, transaction timeout, and fingerprint algorithms.
+//
+// Parameters:
+//   - config (*tlsConfig): The configuration object containing the settings
+//     to be applied to the tlsPlugin instance.
+//
+// Returns:
+//   - error: An error is returned if there is an issue with retrieving a fingerprint
+//     algorithm specified in the configuration; otherwise, nil.
 func (plugin *tlsPlugin) setFromConfig(config *tlsConfig) error {
 	plugin.ports = config.Ports
 	plugin.sendCertificates = config.SendCertificates
@@ -125,14 +188,34 @@ func (plugin *tlsPlugin) setFromConfig(config *tlsConfig) error {
 	return nil
 }
 
+
+// GetPorts returns the list of ports that the TLS plugin is configured to monitor.
+// These ports are used to identify network traffic that should be processed by the plugin.
 func (plugin *tlsPlugin) GetPorts() []int {
 	return plugin.ports
 }
 
+// ConnectionTimeout returns the duration after which a TLS connection
+// is considered timed out if no activity is detected. This value is
+// defined by the transactionTimeout field of the tlsPlugin.
 func (plugin *tlsPlugin) ConnectionTimeout() time.Duration {
 	return plugin.transactionTimeout
 }
 
+// Parse processes a packet for the TLS protocol, updating the connection state
+// and returning the updated protocol data. It ensures that a TLS connection
+// object is initialized, sets the start time for new connections, and delegates
+// further parsing to the doParse method.
+//
+// Parameters:
+//   - pkt: The packet to be processed.
+//   - tcptuple: The TCP tuple associated with the packet.
+//   - dir: The direction of the packet (e.g., incoming or outgoing).
+//   - private: Protocol-specific data associated with the connection.
+//
+// Returns:
+//   - Updated protocol data for the TLS connection, or nil if the connection
+//     is no longer valid.
 func (plugin *tlsPlugin) Parse(
 	pkt *protos.Packet,
 	tcptuple *common.TCPTuple,
@@ -172,9 +255,9 @@ func (plugin *tlsPlugin) doParse(
 ) *tlsConnectionData {
 	// Ignore further traffic after the handshake is completed (encrypted connection)
 	// TODO: request/response analysis
-	if conn.handshakeCompleted&(1<<dir) != 0 {
-		return conn
-	}
+	// if conn.handshakeCompleted&(1<<dir) != 0 {
+	// 	return conn
+	// }
 
 	st := conn.streams[dir]
 	if st == nil {
@@ -193,11 +276,27 @@ func (plugin *tlsPlugin) doParse(
 	state := resultOK
 	for state == resultOK && st.Buf.Len() > 0 {
 
-		state = st.parser.parse(&st.Buf)
+		//plugin.mu.Lock()
+    	//defer plugin.mu.Unlock()
+		ipPortTuple := getIPPortTuple((*st.tcptuple))
+		var hashKey common.HashableIPPortTuple
+		if st.parser.direction == dirServer {
+			hashKey = ipPortTuple.RevHashable()
+		} else {
+			hashKey = ipPortTuple.Hashable()
+		}
+		
+		masterSecret := plugin.masterSecretMap[hashKey]
+		state = st.parser.parse(st, &plugin.mu, &plugin.keyMap)
+		plugin.masterSecretMap[hashKey] = masterSecret
+
 		switch state {
 
-		case resultOK, resultMore:
+		case resultOK:
 			// no-op
+		
+		case resultMore:
+			// no-op			
 
 		case resultFailed:
 			// drop this tcp stream. Will retry parsing with the next
@@ -207,16 +306,22 @@ func (plugin *tlsPlugin) doParse(
 				debugf("non-TLS message: TCP stream dropped. Try parsing with the next segment")
 			}
 
-		case resultEncrypted:
-			conn.handshakeCompleted |= 1 << dir
-			if conn.handshakeCompleted == 3 {
-				conn.endTime = pkt.Ts
-				plugin.sendEvent(conn)
-			}
+		// case resultEncrypted:
+		// 	conn.handshakeCompleted |= 1 << dir
+		// 	if conn.handshakeCompleted == 3 {
+		// 		conn.endTime = pkt.Ts
+		// 		plugin.sendEvent(conn)
+		// 	}
 		}
 	}
 
 	return conn
+}
+
+func getIPPortTuple(tcptuple common.TCPTuple) common.IPPortTuple {
+	iptuple := common.NewIPPortTuple(tcptuple.IPLength, tcptuple.SrcIP, tcptuple.SrcPort, tcptuple.DstIP, tcptuple.DstPort)
+
+	return iptuple
 }
 
 func newStream(tcptuple *common.TCPTuple) *stream {
@@ -224,6 +329,7 @@ func newStream(tcptuple *common.TCPTuple) *stream {
 		tcptuple: tcptuple,
 	}
 	s.Stream.Init(tcp.TCPMaxDataInStream)
+	s.sequenceNumber = 0
 	return s
 }
 
@@ -259,7 +365,10 @@ func (plugin *tlsPlugin) createEvent(conn *tlsConnectionData) beat.Event {
 		status = common.ERROR_STATUS
 	}
 
-	emptyStream := &stream{}
+	emptyStream := &stream{
+		sequenceNumber: 0,
+		random: make([]byte, 32),
+	}
 	client := conn.streams[0]
 	server := conn.streams[1]
 	if client == nil {
